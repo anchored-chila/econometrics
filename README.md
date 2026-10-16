@@ -19,19 +19,34 @@ Aplicación web integral diseñada para evaluar la rentabilidad financiera, inge
 
 ## 🛠️ Cómo Ejecutar el Proyecto (Rápido)
 
-### En Windows:
-1. Asegúrate de tener instalado [Python 3.10+](https://www.python.org/downloads/) (marca la casilla **"Add Python to PATH"** al instalar).
-2. Haz doble clic en el archivo **`run.bat`**.
-3. El script creará el entorno virtual, instalará las dependencias necesarias y abrirá la aplicación en tu navegador en `http://localhost:8000`.
+### En Windows
 
-### En Mac o Linux:
-1. Abre una terminal en la carpeta del proyecto.
-2. Da permisos de ejecución y corre:
-   ```bash
-   chmod +x run.sh
-   ./run.sh
-   ```
-3. Abre tu navegador en `http://localhost:8000` (o `http://localhost:8000/tracker.html` para el Control Operativo).
+Instala Python 3.10 o posterior con **Add Python to PATH**. Ejecuta `iniciar.bat` o `run.bat` con doble clic.
+
+### En Linux
+
+Instala Python 3.10 o posterior y el soporte de entornos virtuales. En Debian/Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install python3 python3-venv git
+```
+
+Desde la carpeta del proyecto:
+
+```bash
+bash run.sh
+```
+
+En macOS también puedes usar `bash run.sh` con Python 3.10 o posterior instalado.
+
+### En ambos equipos
+
+El arranque crea `.venv` localmente e instala las dependencias de `requirements.txt`. Abre **http://127.0.0.1:8000**. Detén el servidor con **Ctrl+C**.
+
+Cada PC ejecuta su propia instancia. Al guardar código Python el servidor se recarga; para cambios de HTML, CSS o JavaScript recarga el navegador. Después de descargar cambios en `requirements.txt`, reinicia el programa para instalar las nuevas dependencias. El arranque necesita acceso a Internet para instalar paquetes que falten.
+
+No copies `.venv` ni `venv` entre Windows y Linux: se crean por separado y Git los excluye. Los scripts conservan los finales de línea adecuados mediante `.gitattributes`.
 
 ---
 

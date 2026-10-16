@@ -21,7 +21,22 @@ git config user.email "Tu correo de GitHub o correo noreply"
 git config pull.ff only
 ```
 
-5. En Windows ejecutar `iniciar.bat`. Cada PC tendrá su propio entorno Python y su propia clave de Gemini.
+5. En Windows ejecutar `iniciar.bat`. En Linux ejecutar `bash run.sh` desde la carpeta del proyecto (Python 3.10+; en Debian/Ubuntu instalar `python3-venv`). Abrir http://127.0.0.1:8000. Cada PC tendrá su propio entorno Python y su propia clave de Gemini.
+
+### Flujo del compañero en Linux usando Git
+
+```bash
+git clone https://github.com/anchored-chila/econometrics.git
+cd econometrics
+git config user.name "mixiotes12"
+git config user.email "SU_CORREO_VERIFICADO_O_NOREPLY"
+git config pull.ff only
+bash run.sh
+```
+
+Para editar, usar otra terminal en la misma carpeta. Antes de comenzar: `git pull --ff-only`. Después de editar: `git status`, `git add` con los archivos modificados, `git commit -m "Descripcion"` y `git push`. GitHub puede solicitar autenticación al publicar; el nombre y correo de autor no inician sesión.
+
+El usuario de Windows puede usar GitHub Desktop y el de Linux los comandos Git: ambos comparten las mismas ramas y commits. Para trabajo simultáneo, usar una rama por tarea como se explica abajo.
 
 ## Compartir cambios
 
