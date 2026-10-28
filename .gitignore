@@ -34,3 +34,6 @@ update_*.py
 .vscode/
 .idea/
 .DS_Store
+
+# Base de datos local del POS
+app/data/

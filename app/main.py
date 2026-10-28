@@ -278,6 +278,11 @@ async def api_generate_flowchart(req: ProcessRequest, x_gemini_api_key: str = He
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al generar diagrama de flujo: {str(e)}")
 
+# Módulo POS & Ventas (Fase 1)
+from .pos import router as pos_router, init_pos_db
+init_pos_db()
+app.include_router(pos_router)
+
 # Static files for the frontend
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if not os.path.exists(static_dir):

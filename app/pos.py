@@ -1,0 +1,779 @@
+"""
+Módulo POS & Ventas (Fase 1)
+- Cajeros (login por PIN) y turnos de caja (apertura, movimientos, Corte X / Corte Z)
+- Búsqueda por código de barras / SKU / nombre
+- Ventas con desglose de IVA (16%, 0%, exento), descuento de inventario
+- Ticket imprimible (58mm / 80mm)
+- Facturación CFDI 4.0 (XML pre-timbrado; el timbrado requiere un PAC externo)
+
+Persistencia: SQLite (librería estándar) en app/data/pos.db
+"""
+import os
+import re
+import secrets
+import sqlite3
+import hashlib
+from contextlib import contextmanager
+from datetime import datetime
+from html import escape
+from typing import List, Optional
+from xml.etree import ElementTree as ET
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse, Response
+from pydantic import BaseModel, Field
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+DB_PATH = os.path.join(DATA_DIR, "pos.db")
+
+router = APIRouter(prefix="/api/pos", tags=["POS"])
+
+IVA_TYPES = {"iva16": 0.16, "iva0": 0.0, "exento": 0.0}
+PAYMENT_METHODS = {"efectivo": "01", "tarjeta": "04", "transferencia": "03"}
+RFC_RE = re.compile(r"^[A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3}$")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS cashiers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    pin_hash TEXT NOT NULL,
+    is_admin INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS shifts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cashier_id INTEGER NOT NULL REFERENCES cashiers(id),
+    opened_at TEXT NOT NULL,
+    opening_float REAL NOT NULL DEFAULT 0,
+    closed_at TEXT,
+    counted_cash REAL,
+    expected_cash REAL,
+    difference REAL,
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'abierto'
+);
+CREATE TABLE IF NOT EXISTS cash_movements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shift_id INTEGER NOT NULL REFERENCES shifts(id),
+    type TEXT NOT NULL CHECK (type IN ('entrada','salida')),
+    amount REAL NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sku TEXT UNIQUE,
+    barcode TEXT UNIQUE,
+    name TEXT NOT NULL,
+    price REAL NOT NULL DEFAULT 0,          -- precio al público con IVA incluido
+    cost REAL NOT NULL DEFAULT 0,
+    iva_type TEXT NOT NULL DEFAULT 'iva16',
+    stock REAL NOT NULL DEFAULT 0,
+    track_stock INTEGER NOT NULL DEFAULT 1,
+    sat_product_key TEXT NOT NULL DEFAULT '01010101',
+    sat_unit_key TEXT NOT NULL DEFAULT 'H87',
+    active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS sales (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    folio TEXT UNIQUE,
+    shift_id INTEGER NOT NULL REFERENCES shifts(id),
+    cashier_id INTEGER NOT NULL REFERENCES cashiers(id),
+    created_at TEXT NOT NULL,
+    subtotal REAL NOT NULL,
+    iva REAL NOT NULL,
+    total REAL NOT NULL,
+    payment_method TEXT NOT NULL,
+    received REAL NOT NULL,
+    change_given REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'completada'
+);
+CREATE TABLE IF NOT EXISTS sale_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sale_id INTEGER NOT NULL REFERENCES sales(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    name TEXT NOT NULL,
+    barcode TEXT,
+    qty REAL NOT NULL,
+    unit_price REAL NOT NULL,               -- con IVA
+    unit_net REAL NOT NULL,                 -- sin IVA
+    iva_type TEXT NOT NULL,
+    iva REAL NOT NULL,
+    total REAL NOT NULL,
+    sat_product_key TEXT NOT NULL,
+    sat_unit_key TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sale_id INTEGER NOT NULL UNIQUE REFERENCES sales(id),
+    serie TEXT NOT NULL,
+    folio TEXT NOT NULL,
+    rfc TEXT NOT NULL,
+    razon_social TEXT NOT NULL,
+    regimen_fiscal TEXT NOT NULL,
+    codigo_postal TEXT NOT NULL,
+    uso_cfdi TEXT NOT NULL,
+    email TEXT,
+    xml TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pendiente_timbrado',
+    created_at TEXT NOT NULL
+);
+"""
+
+DEFAULT_SETTINGS = {
+    "business_name": "Mi Negocio",
+    "legal_name": "",
+    "rfc": "XAXX010101000",
+    "tax_regime": "601",
+    "address": "",
+    "zip_code": "00000",
+    "phone": "",
+    "ticket_width": "80",
+    "ticket_footer": "¡Gracias por su compra!",
+    "invoice_series": "A",
+}
+
+
+# ------------------------------------------------------------------ DB helpers
+@contextmanager
+def db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def hash_pin(pin: str) -> str:
+    return hashlib.sha256(("pos-salt:" + pin).encode()).hexdigest()
+
+
+def init_pos_db():
+    with db() as conn:
+        conn.executescript(SCHEMA)
+        for k, v in DEFAULT_SETTINGS.items():
+            conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
+        if conn.execute("SELECT COUNT(*) FROM cashiers").fetchone()[0] == 0:
+            conn.execute(
+                "INSERT INTO cashiers(name, pin_hash, is_admin, active, created_at) VALUES (?,?,1,1,?)",
+                ("Administrador", hash_pin("1234"), now()),
+            )
+
+
+def get_settings(conn) -> dict:
+    return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
+
+
+def money(x: float) -> float:
+    return round(float(x) + 1e-9, 2)
+
+
+# ------------------------------------------------------------------ Auth (PIN + token en memoria)
+SESSIONS: dict = {}  # token -> cashier_id
+
+
+def current_cashier(x_pos_token: Optional[str] = Header(None)) -> dict:
+    cid = SESSIONS.get(x_pos_token or "")
+    if not cid:
+        raise HTTPException(401, "Sesión no válida. Inicia sesión con tu PIN.")
+    with db() as conn:
+        row = conn.execute("SELECT * FROM cashiers WHERE id=? AND active=1", (cid,)).fetchone()
+    if not row:
+        raise HTTPException(401, "Cajero inactivo o inexistente.")
+    return dict(row)
+
+
+def admin_only(c: dict = Depends(current_cashier)) -> dict:
+    if not c["is_admin"]:
+        raise HTTPException(403, "Se requiere nivel Administrador.")
+    return c
+
+
+class LoginReq(BaseModel):
+    cashier_id: int
+    pin: str
+
+
+@router.get("/cashiers/public")
+def public_cashiers():
+    init_pos_db()
+    with db() as conn:
+        rows = conn.execute("SELECT id, name FROM cashiers WHERE active=1 ORDER BY name").fetchall()
+    return [dict(r) for r in rows]
+
+
+@router.post("/login")
+def login(req: LoginReq):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM cashiers WHERE id=? AND active=1", (req.cashier_id,)).fetchone()
+    if not row or row["pin_hash"] != hash_pin(req.pin):
+        raise HTTPException(401, "Cajero o PIN incorrecto.")
+    token = secrets.token_hex(24)
+    SESSIONS[token] = row["id"]
+    return {"token": token, "cashier": {"id": row["id"], "name": row["name"], "is_admin": bool(row["is_admin"])}}
+
+
+@router.post("/logout")
+def logout(x_pos_token: Optional[str] = Header(None)):
+    SESSIONS.pop(x_pos_token or "", None)
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ Cajeros (admin)
+class CashierIn(BaseModel):
+    name: str = Field(min_length=2)
+    pin: Optional[str] = Field(default=None, pattern=r"^\d{4,8}$")
+    is_admin: bool = False
+    active: bool = True
+
+
+@router.get("/cashiers")
+def list_cashiers(_: dict = Depends(admin_only)):
+    with db() as conn:
+        rows = conn.execute("SELECT id, name, is_admin, active, created_at FROM cashiers ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+@router.post("/cashiers")
+def create_cashier(c: CashierIn, _: dict = Depends(admin_only)):
+    if not c.pin:
+        raise HTTPException(400, "El PIN (4 a 8 dígitos) es obligatorio.")
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO cashiers(name, pin_hash, is_admin, active, created_at) VALUES (?,?,?,?,?)",
+            (c.name.strip(), hash_pin(c.pin), int(c.is_admin), int(c.active), now()),
+        )
+    return {"id": cur.lastrowid}
+
+
+@router.put("/cashiers/{cashier_id}")
+def update_cashier(cashier_id: int, c: CashierIn, me: dict = Depends(admin_only)):
+    if cashier_id == me["id"] and (not c.active or not c.is_admin):
+        raise HTTPException(400, "No puedes desactivarte ni quitarte el rol de administrador.")
+    with db() as conn:
+        conn.execute(
+            "UPDATE cashiers SET name=?, is_admin=?, active=? WHERE id=?",
+            (c.name.strip(), int(c.is_admin), int(c.active), cashier_id),
+        )
+        if c.pin:
+            conn.execute("UPDATE cashiers SET pin_hash=? WHERE id=?", (hash_pin(c.pin), cashier_id))
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ Configuración del negocio / ticket
+@router.get("/settings")
+def read_settings(_: dict = Depends(current_cashier)):
+    with db() as conn:
+        return get_settings(conn)
+
+
+@router.put("/settings")
+def write_settings(data: dict, _: dict = Depends(admin_only)):
+    with db() as conn:
+        for k, v in data.items():
+            if k in DEFAULT_SETTINGS:
+                conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (k, str(v)))
+        return get_settings(conn)
+
+
+# ------------------------------------------------------------------ Turnos de caja
+class OpenShiftReq(BaseModel):
+    opening_float: float = Field(ge=0)
+
+
+class MovementReq(BaseModel):
+    type: str = Field(pattern="^(entrada|salida)$")
+    amount: float = Field(gt=0)
+    reason: str = Field(min_length=3)
+
+
+class CloseShiftReq(BaseModel):
+    counted_cash: float = Field(ge=0)
+    notes: Optional[str] = ""
+
+
+def open_shift_of(conn, cashier_id: int):
+    return conn.execute(
+        "SELECT * FROM shifts WHERE cashier_id=? AND status='abierto' ORDER BY id DESC LIMIT 1", (cashier_id,)
+    ).fetchone()
+
+
+def shift_report(conn, shift_id: int) -> dict:
+    s = conn.execute("SELECT * FROM shifts WHERE id=?", (shift_id,)).fetchone()
+    if not s:
+        raise HTTPException(404, "Turno no encontrado.")
+    by_method = {m: 0.0 for m in PAYMENT_METHODS}
+    count = 0
+    subtotal = iva = total = 0.0
+    for r in conn.execute(
+        "SELECT payment_method, COUNT(*) n, SUM(subtotal) st, SUM(iva) iv, SUM(total) t "
+        "FROM sales WHERE shift_id=? AND status='completada' GROUP BY payment_method", (shift_id,)
+    ):
+        by_method[r["payment_method"]] = money(r["t"])
+        count += r["n"]
+        subtotal += r["st"]; iva += r["iv"]; total += r["t"]
+    cancelled = conn.execute(
+        "SELECT COUNT(*) n, COALESCE(SUM(total),0) t FROM sales WHERE shift_id=? AND status='cancelada'", (shift_id,)
+    ).fetchone()
+    mv = {"entrada": 0.0, "salida": 0.0}
+    for r in conn.execute("SELECT type, SUM(amount) a FROM cash_movements WHERE shift_id=? GROUP BY type", (shift_id,)):
+        mv[r["type"]] = money(r["a"])
+    expected = money(s["opening_float"] + by_method["efectivo"] + mv["entrada"] - mv["salida"])
+    cashier = conn.execute("SELECT name FROM cashiers WHERE id=?", (s["cashier_id"],)).fetchone()
+    return {
+        "shift": dict(s),
+        "cashier_name": cashier["name"] if cashier else "",
+        "sales_count": count,
+        "subtotal": money(subtotal), "iva": money(iva), "total": money(total),
+        "by_method": by_method,
+        "cancelled_count": cancelled["n"], "cancelled_total": money(cancelled["t"]),
+        "cash_in": mv["entrada"], "cash_out": mv["salida"],
+        "expected_cash": expected,
+    }
+
+
+@router.get("/shifts/current")
+def current_shift(me: dict = Depends(current_cashier)):
+    with db() as conn:
+        s = open_shift_of(conn, me["id"])
+        return {"shift": dict(s) if s else None, "report": shift_report(conn, s["id"]) if s else None}
+
+
+@router.post("/shifts/open")
+def open_shift(req: OpenShiftReq, me: dict = Depends(current_cashier)):
+    with db() as conn:
+        if open_shift_of(conn, me["id"]):
+            raise HTTPException(400, "Ya tienes un turno abierto.")
+        cur = conn.execute(
+            "INSERT INTO shifts(cashier_id, opened_at, opening_float) VALUES (?,?,?)",
+            (me["id"], now(), money(req.opening_float)),
+        )
+        return {"id": cur.lastrowid}
+
+
+@router.post("/shifts/movement")
+def cash_movement(req: MovementReq, me: dict = Depends(current_cashier)):
+    with db() as conn:
+        s = open_shift_of(conn, me["id"])
+        if not s:
+            raise HTTPException(400, "Abre un turno primero.")
+        conn.execute(
+            "INSERT INTO cash_movements(shift_id, type, amount, reason, created_at) VALUES (?,?,?,?,?)",
+            (s["id"], req.type, money(req.amount), req.reason.strip(), now()),
+        )
+        return shift_report(conn, s["id"])
+
+
+@router.get("/shifts/report/x")
+def corte_x(me: dict = Depends(current_cashier)):
+    """Corte X: reporte parcial sin cerrar el turno."""
+    with db() as conn:
+        s = open_shift_of(conn, me["id"])
+        if not s:
+            raise HTTPException(400, "No hay turno abierto.")
+        return shift_report(conn, s["id"])
+
+
+@router.post("/shifts/close")
+def corte_z(req: CloseShiftReq, me: dict = Depends(current_cashier)):
+    """Corte Z: cierra el turno, calcula la diferencia de arqueo."""
+    with db() as conn:
+        s = open_shift_of(conn, me["id"])
+        if not s:
+            raise HTTPException(400, "No hay turno abierto.")
+        rep = shift_report(conn, s["id"])
+        expected = rep["expected_cash"]
+        diff = money(req.counted_cash - expected)
+        conn.execute(
+            "UPDATE shifts SET status='cerrado', closed_at=?, counted_cash=?, expected_cash=?, difference=?, notes=? WHERE id=?",
+            (now(), money(req.counted_cash), expected, diff, req.notes or "", s["id"]),
+        )
+        return shift_report(conn, s["id"])
+
+
+@router.get("/shifts")
+def list_shifts(me: dict = Depends(current_cashier), limit: int = 50):
+    with db() as conn:
+        q = "SELECT s.*, c.name cashier_name FROM shifts s JOIN cashiers c ON c.id=s.cashier_id "
+        args: list = []
+        if not me["is_admin"]:
+            q += "WHERE s.cashier_id=? "
+            args.append(me["id"])
+        q += "ORDER BY s.id DESC LIMIT ?"
+        args.append(limit)
+        return [dict(r) for r in conn.execute(q, args)]
+
+
+# ------------------------------------------------------------------ Productos (mínimo para POS; Fase 2 lo amplía)
+class ProductIn(BaseModel):
+    sku: Optional[str] = None
+    barcode: Optional[str] = None
+    name: str = Field(min_length=1)
+    price: float = Field(ge=0)
+    cost: float = Field(default=0, ge=0)
+    iva_type: str = "iva16"
+    stock: float = 0
+    track_stock: bool = True
+    sat_product_key: str = "01010101"
+    sat_unit_key: str = "H87"
+    active: bool = True
+
+
+def _prod_args(p: ProductIn):
+    if p.iva_type not in IVA_TYPES:
+        raise HTTPException(400, "Tipo de IVA inválido (iva16, iva0, exento).")
+    return (
+        (p.sku or "").strip() or None, (p.barcode or "").strip() or None, p.name.strip(), money(p.price),
+        money(p.cost), p.iva_type, p.stock, int(p.track_stock), p.sat_product_key, p.sat_unit_key, int(p.active),
+    )
+
+
+@router.get("/products")
+def list_products(q: str = "", include_inactive: bool = False, _: dict = Depends(current_cashier)):
+    sql = "SELECT * FROM products WHERE 1=1 "
+    args: list = []
+    if not include_inactive:
+        sql += "AND active=1 "
+    if q:
+        sql += "AND (name LIKE ? OR sku LIKE ? OR barcode LIKE ?) "
+        args += [f"%{q}%"] * 3
+    sql += "ORDER BY name LIMIT 200"
+    with db() as conn:
+        return [dict(r) for r in conn.execute(sql, args)]
+
+
+@router.get("/products/barcode/{code}")
+def product_by_code(code: str, _: dict = Depends(current_cashier)):
+    with db() as conn:
+        r = conn.execute("SELECT * FROM products WHERE (barcode=? OR sku=?) AND active=1", (code, code)).fetchone()
+    if not r:
+        raise HTTPException(404, "Producto no encontrado.")
+    return dict(r)
+
+
+@router.post("/products")
+def create_product(p: ProductIn, _: dict = Depends(admin_only)):
+    try:
+        with db() as conn:
+            cur = conn.execute(
+                "INSERT INTO products(sku, barcode, name, price, cost, iva_type, stock, track_stock, "
+                "sat_product_key, sat_unit_key, active) VALUES (?,?,?,?,?,?,?,?,?,?,?)", _prod_args(p))
+            return {"id": cur.lastrowid}
+    except sqlite3.IntegrityError:
+        raise HTTPException(400, "SKU o código de barras duplicado.")
+
+
+@router.put("/products/{pid}")
+def update_product(pid: int, p: ProductIn, _: dict = Depends(admin_only)):
+    try:
+        with db() as conn:
+            conn.execute(
+                "UPDATE products SET sku=?, barcode=?, name=?, price=?, cost=?, iva_type=?, stock=?, track_stock=?, "
+                "sat_product_key=?, sat_unit_key=?, active=? WHERE id=?", _prod_args(p) + (pid,))
+        return {"ok": True}
+    except sqlite3.IntegrityError:
+        raise HTTPException(400, "SKU o código de barras duplicado.")
+
+
+# ------------------------------------------------------------------ Ventas
+class SaleLine(BaseModel):
+    product_id: int
+    qty: float = Field(gt=0)
+
+
+class SaleReq(BaseModel):
+    items: List[SaleLine] = Field(min_length=1)
+    payment_method: str
+    received: float = Field(ge=0)
+
+
+def split_iva(gross: float, iva_type: str):
+    """Precio con IVA incluido -> (neto, iva)."""
+    rate = IVA_TYPES[iva_type]
+    net = gross / (1 + rate)
+    return net, gross - net
+
+
+@router.post("/sales")
+def create_sale(req: SaleReq, me: dict = Depends(current_cashier)):
+    if req.payment_method not in PAYMENT_METHODS:
+        raise HTTPException(400, "Forma de pago inválida.")
+    with db() as conn:
+        shift = open_shift_of(conn, me["id"])
+        if not shift:
+            raise HTTPException(400, "Debes abrir turno de caja antes de vender.")
+        lines, subtotal, iva_total, total = [], 0.0, 0.0, 0.0
+        for ln in req.items:
+            p = conn.execute("SELECT * FROM products WHERE id=? AND active=1", (ln.product_id,)).fetchone()
+            if not p:
+                raise HTTPException(404, f"Producto {ln.product_id} no existe o está inactivo.")
+            if p["track_stock"] and p["stock"] < ln.qty:
+                raise HTTPException(400, f"Stock insuficiente de '{p['name']}' (disponible: {p['stock']}).")
+            gross = money(p["price"] * ln.qty)
+            net, iva = split_iva(gross, p["iva_type"])
+            lines.append((p, ln.qty, gross, money(net), money(iva)))
+            subtotal += money(net); iva_total += money(iva); total += gross
+        subtotal, iva_total, total = money(subtotal), money(iva_total), money(total)
+        if req.payment_method == "efectivo":
+            if req.received + 1e-9 < total:
+                raise HTTPException(400, "El efectivo recibido es menor al total.")
+            received, change = money(req.received), money(req.received - total)
+        else:
+            received, change = total, 0.0
+        cur = conn.execute(
+            "INSERT INTO sales(shift_id, cashier_id, created_at, subtotal, iva, total, payment_method, received, change_given) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (shift["id"], me["id"], now(), subtotal, iva_total, total, req.payment_method, received, change),
+        )
+        sale_id = cur.lastrowid
+        conn.execute("UPDATE sales SET folio=? WHERE id=?", (f"V-{sale_id:06d}", sale_id))
+        for p, qty, gross, net, iva in lines:
+            conn.execute(
+                "INSERT INTO sale_items(sale_id, product_id, name, barcode, qty, unit_price, unit_net, iva_type, iva, total, "
+                "sat_product_key, sat_unit_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sale_id, p["id"], p["name"], p["barcode"], qty, p["price"], money(p["price"] / (1 + IVA_TYPES[p["iva_type"]])),
+                 p["iva_type"], iva, gross, p["sat_product_key"], p["sat_unit_key"]),
+            )
+            if p["track_stock"]:
+                conn.execute("UPDATE products SET stock = stock - ? WHERE id=?", (qty, p["id"]))
+        return get_sale(conn, sale_id)
+
+
+def get_sale(conn, sale_id: int) -> dict:
+    s = conn.execute(
+        "SELECT s.*, c.name cashier_name FROM sales s JOIN cashiers c ON c.id=s.cashier_id WHERE s.id=?", (sale_id,)
+    ).fetchone()
+    if not s:
+        raise HTTPException(404, "Venta no encontrada.")
+    sale = dict(s)
+    sale["items"] = [dict(r) for r in conn.execute("SELECT * FROM sale_items WHERE sale_id=?", (sale_id,))]
+    inv = conn.execute("SELECT id, serie, folio, status FROM invoices WHERE sale_id=?", (sale_id,)).fetchone()
+    sale["invoice"] = dict(inv) if inv else None
+    return sale
+
+
+@router.get("/sales")
+def list_sales(me: dict = Depends(current_cashier), limit: int = 50, date: Optional[str] = None):
+    sql = ("SELECT s.id, s.folio, s.created_at, s.total, s.payment_method, s.status, c.name cashier_name, "
+           "(SELECT COUNT(*) FROM invoices i WHERE i.sale_id=s.id) invoiced "
+           "FROM sales s JOIN cashiers c ON c.id=s.cashier_id WHERE 1=1 ")
+    args: list = []
+    if not me["is_admin"]:
+        sql += "AND s.cashier_id=? "
+        args.append(me["id"])
+    if date:
+        sql += "AND substr(s.created_at,1,10)=? "
+        args.append(date)
+    sql += "ORDER BY s.id DESC LIMIT ?"
+    args.append(limit)
+    with db() as conn:
+        return [dict(r) for r in conn.execute(sql, args)]
+
+
+@router.get("/sales/{sale_id}")
+def read_sale(sale_id: int, _: dict = Depends(current_cashier)):
+    with db() as conn:
+        return get_sale(conn, sale_id)
+
+
+@router.post("/sales/{sale_id}/cancel")
+def cancel_sale(sale_id: int, _: dict = Depends(admin_only)):
+    """Cancela una venta (solo admin), regresa el stock. No permite cancelar si ya fue facturada."""
+    with db() as conn:
+        sale = get_sale(conn, sale_id)
+        if sale["status"] == "cancelada":
+            raise HTTPException(400, "La venta ya está cancelada.")
+        if sale["invoice"]:
+            raise HTTPException(400, "La venta ya está facturada; cancela primero la factura.")
+        for it in sale["items"]:
+            conn.execute("UPDATE products SET stock = stock + ? WHERE id=? AND track_stock=1", (it["qty"], it["product_id"]))
+        conn.execute("UPDATE sales SET status='cancelada' WHERE id=?", (sale_id,))
+        return get_sale(conn, sale_id)
+
+
+# ------------------------------------------------------------------ Ticket imprimible
+def render_ticket(sale: dict, st: dict, auto_print: bool) -> str:
+    width = 58 if st.get("ticket_width") == "58" else 80
+    e = escape
+    rows = ""
+    for it in sale["items"]:
+        rows += (f"<tr><td colspan='3'>{e(it['name'])}</td></tr>"
+                 f"<tr><td>{it['qty']:g} x ${it['unit_price']:.2f}</td><td></td><td class='r'>${it['total']:.2f}</td></tr>")
+    iva_breakdown: dict = {}
+    for it in sale["items"]:
+        iva_breakdown.setdefault(it["iva_type"], [0.0, 0.0])
+        iva_breakdown[it["iva_type"]][0] += it["total"] - it["iva"]
+        iva_breakdown[it["iva_type"]][1] += it["iva"]
+    labels = {"iva16": "IVA 16%", "iva0": "IVA 0%", "exento": "Exento"}
+    iva_rows = "".join(
+        f"<tr><td>Base {labels[k]}</td><td class='r' colspan='2'>${v[0]:.2f}</td></tr>"
+        f"<tr><td>{labels[k]}</td><td class='r' colspan='2'>${v[1]:.2f}</td></tr>"
+        for k, v in iva_breakdown.items())
+    cancelled = "<div class='c b'>*** VENTA CANCELADA ***</div>" if sale["status"] == "cancelada" else ""
+    pm = sale["payment_method"].capitalize()
+    cash_rows = (f"<tr><td>Recibido</td><td class='r' colspan='2'>${sale['received']:.2f}</td></tr>"
+                 f"<tr><td>Cambio</td><td class='r' colspan='2'>${sale['change_given']:.2f}</td></tr>"
+                 if sale["payment_method"] == "efectivo" else "")
+    script = "<script>window.onload=()=>{window.print();}</script>" if auto_print else ""
+    return f"""<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Ticket {e(sale['folio'])}</title>
+<style>
+ @page {{ size: {width}mm auto; margin: 2mm; }}
+ body {{ font-family: 'Courier New', monospace; font-size: 12px; width: {width - 6}mm; margin: 0 auto; color:#000; }}
+ table {{ width: 100%; border-collapse: collapse; }} td {{ padding: 1px 0; vertical-align: top; }}
+ .r {{ text-align: right; }} .c {{ text-align: center; }} .b {{ font-weight: bold; }}
+ hr {{ border: 0; border-top: 1px dashed #000; margin: 4px 0; }}
+</style></head><body>
+<div class="c b" style="font-size:14px">{e(st.get('business_name',''))}</div>
+<div class="c">{e(st.get('legal_name',''))}<br>RFC: {e(st.get('rfc',''))}<br>{e(st.get('address',''))}<br>CP {e(st.get('zip_code',''))} {e(st.get('phone',''))}</div>
+<hr>{cancelled}
+<div>Folio: <b>{e(sale['folio'])}</b><br>Fecha: {e(sale['created_at'])}<br>Cajero: {e(sale['cashier_name'])}</div>
+<hr><table>{rows}</table><hr>
+<table>
+<tr><td>Subtotal</td><td class='r' colspan='2'>${sale['subtotal']:.2f}</td></tr>
+{iva_rows}
+<tr class="b" style="font-size:14px"><td>TOTAL</td><td class='r' colspan='2'>${sale['total']:.2f}</td></tr>
+<tr><td>Pago ({e(pm)})</td><td class='r' colspan='2'>${sale['received']:.2f}</td></tr>
+{cash_rows}
+</table><hr>
+<div class="c">{e(st.get('ticket_footer',''))}<br>Para facturar conserve este ticket.<br>Folio de facturación: {e(sale['folio'])}</div>
+<div class="c" style="margin-top:6px">||||| {e(sale['folio'])} |||||</div>
+{script}</body></html>"""
+
+
+@router.get("/sales/{sale_id}/ticket", response_class=HTMLResponse)
+def ticket(sale_id: int, print: bool = Query(False), token: Optional[str] = Query(None),
+           x_pos_token: Optional[str] = Header(None)):
+    if (token or x_pos_token or "") not in SESSIONS:
+        raise HTTPException(401, "Sesión no válida.")
+    with db() as conn:
+        return HTMLResponse(render_ticket(get_sale(conn, sale_id), get_settings(conn), print))
+
+
+# ------------------------------------------------------------------ Facturación CFDI 4.0
+class InvoiceReq(BaseModel):
+    rfc: str
+    razon_social: str = Field(min_length=2)
+    regimen_fiscal: str = Field(pattern=r"^\d{3}$")
+    codigo_postal: str = Field(pattern=r"^\d{5}$")
+    uso_cfdi: str = Field(default="G03", min_length=3, max_length=4)
+    email: Optional[str] = None
+
+
+def build_cfdi_xml(sale: dict, st: dict, inv: InvoiceReq, serie: str, folio: str) -> str:
+    NS = "http://www.sat.gob.mx/cfd/4"
+    ET.register_namespace("cfdi", NS)
+    ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
+    q = lambda t: f"{{{NS}}}{t}"
+    gravados, exentos = {}, 0.0  # tasa -> [base, importe]
+    for it in sale["items"]:
+        base = it["total"] - it["iva"]
+        if it["iva_type"] == "exento":
+            exentos += base
+        else:
+            t = gravados.setdefault(IVA_TYPES[it["iva_type"]], [0.0, 0.0])
+            t[0] += base; t[1] += it["iva"]
+    total_trasladado = sum(v[1] for v in gravados.values())
+    root = ET.Element(q("Comprobante"), {
+        "{http://www.w3.org/2001/XMLSchema-instance}schemaLocation":
+            "http://www.sat.gob.mx/cfd/4 http://www.sat.gob.mx/sitio_internet/cfd/4/cfdv40.xsd",
+        "Version": "4.0", "Serie": serie, "Folio": folio,
+        "Fecha": sale["created_at"].replace(" ", "T"),
+        "FormaPago": PAYMENT_METHODS[sale["payment_method"]], "MetodoPago": "PUE",
+        "SubTotal": f"{sale['subtotal']:.2f}", "Moneda": "MXN", "Total": f"{sale['total']:.2f}",
+        "TipoDeComprobante": "I", "Exportacion": "01", "LugarExpedicion": st.get("zip_code", "00000"),
+    })
+    ET.SubElement(root, q("Emisor"), {
+        "Rfc": st.get("rfc", ""), "Nombre": st.get("legal_name") or st.get("business_name", ""),
+        "RegimenFiscal": st.get("tax_regime", "601")})
+    ET.SubElement(root, q("Receptor"), {
+        "Rfc": inv.rfc, "Nombre": inv.razon_social.upper(), "DomicilioFiscalReceptor": inv.codigo_postal,
+        "RegimenFiscalReceptor": inv.regimen_fiscal, "UsoCFDI": inv.uso_cfdi})
+    conceptos = ET.SubElement(root, q("Conceptos"))
+    for it in sale["items"]:
+        base = it["total"] - it["iva"]
+        c = ET.SubElement(conceptos, q("Concepto"), {
+            "ClaveProdServ": it["sat_product_key"], "Cantidad": f"{it['qty']:g}", "ClaveUnidad": it["sat_unit_key"],
+            "Descripcion": it["name"], "ValorUnitario": f"{base / it['qty']:.6f}", "Importe": f"{base:.2f}",
+            "ObjetoImp": "02"})
+        imp = ET.SubElement(ET.SubElement(c, q("Impuestos")), q("Traslados"))
+        if it["iva_type"] == "exento":
+            ET.SubElement(imp, q("Traslado"), {"Base": f"{base:.2f}", "Impuesto": "002", "TipoFactor": "Exento"})
+        else:
+            ET.SubElement(imp, q("Traslado"), {
+                "Base": f"{base:.2f}", "Impuesto": "002", "TipoFactor": "Tasa",
+                "TasaOCuota": f"{IVA_TYPES[it['iva_type']]:.6f}", "Importe": f"{it['iva']:.2f}"})
+    imps = ET.SubElement(root, q("Impuestos"), {"TotalImpuestosTrasladados": f"{total_trasladado:.2f}"})
+    tr = ET.SubElement(imps, q("Traslados"))
+    for rate, (base, importe) in gravados.items():
+        ET.SubElement(tr, q("Traslado"), {
+            "Base": f"{base:.2f}", "Impuesto": "002", "TipoFactor": "Tasa",
+            "TasaOCuota": f"{rate:.6f}", "Importe": f"{importe:.2f}"})
+    if exentos:
+        ET.SubElement(tr, q("Traslado"), {"Base": f"{exentos:.2f}", "Impuesto": "002", "TipoFactor": "Exento"})
+    ET.indent(root)
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode")
+
+
+@router.post("/sales/{sale_id}/invoice")
+def create_invoice(sale_id: int, req: InvoiceReq, _: dict = Depends(current_cashier)):
+    """
+    Genera el CFDI 4.0 en XML (sin Sello/Certificado/Timbre). Queda 'pendiente_timbrado':
+    el timbrado fiscal real requiere conectar un PAC y el CSD del emisor.
+    """
+    rfc = req.rfc.strip().upper()
+    if not RFC_RE.match(rfc):
+        raise HTTPException(400, "RFC del receptor inválido.")
+    req.rfc = rfc
+    with db() as conn:
+        sale = get_sale(conn, sale_id)
+        st = get_settings(conn)
+        if sale["status"] != "completada":
+            raise HTTPException(400, "Solo se pueden facturar ventas completadas.")
+        if sale["invoice"]:
+            raise HTTPException(400, "La venta ya fue facturada.")
+        if not RFC_RE.match(st.get("rfc", "")) or st.get("rfc") == "XAXX010101000":
+            raise HTTPException(400, "Configura el RFC del emisor en Configuración antes de facturar.")
+        serie = st.get("invoice_series", "A")
+        folio = str(sale_id)
+        xml = build_cfdi_xml(sale, st, req, serie, folio)
+        conn.execute(
+            "INSERT INTO invoices(sale_id, serie, folio, rfc, razon_social, regimen_fiscal, codigo_postal, uso_cfdi, email, xml, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (sale_id, serie, folio, rfc, req.razon_social.upper(), req.regimen_fiscal, req.codigo_postal,
+             req.uso_cfdi, req.email, xml, now()),
+        )
+        return {"serie": serie, "folio": folio, "status": "pendiente_timbrado"}
+
+
+@router.get("/invoices")
+def list_invoices(me: dict = Depends(current_cashier)):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT i.id, i.sale_id, i.serie, i.folio, i.rfc, i.razon_social, i.status, i.created_at, s.total, s.folio sale_folio "
+            "FROM invoices i JOIN sales s ON s.id=i.sale_id ORDER BY i.id DESC LIMIT 100").fetchall()
+    return [dict(r) for r in rows]
+
+
+@router.get("/invoices/{invoice_id}/xml")
+def invoice_xml(invoice_id: int, token: Optional[str] = Query(None), x_pos_token: Optional[str] = Header(None)):
+    if (token or x_pos_token or "") not in SESSIONS:
+        raise HTTPException(401, "Sesión no válida.")
+    with db() as conn:
+        r = conn.execute("SELECT serie, folio, xml FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+    if not r:
+        raise HTTPException(404, "Factura no encontrada.")
+    return Response(r["xml"], media_type="application/xml",
+                    headers={"Content-Disposition": f'attachment; filename="CFDI_{r["serie"]}{r["folio"]}.xml"'})
